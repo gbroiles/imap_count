@@ -4,14 +4,14 @@ import pandas as pd
 import json
 import yaml
 import logging
-import tqdm
+from tqdm import tqdm
+import sys
+import os
 
-def load_credentials(filepath):
+def load_credentials():
     try:
-        with open(filepath, 'r') as file:
-            credentials = yaml.safe_load(file)
-            user = credentials['user']
-            password = credentials['password']
+            user = os.getenv('GMAIL_ACCT')
+            password = os.getenv('GMAIL_PASS')
             return user, password
     except Exception as e:
         logging.error("Failed to load credentials: {}".format(e))
@@ -35,16 +35,33 @@ def get_emails_to_delete(mail, filepath):
         emails_to_delete = data['emails']
 
     summary = pd.DataFrame(columns=['Email', 'Count'])
+    rows = []
     for email in tqdm(emails_to_delete):
         _, messages = mail.search(None, 'FROM "{}"'.format(email))
-        mail.store(messages, '+FLAGS', '\\Deleted')
-        summary = summary.append({'Email': email, 'Count': len(messages)}, ignore_index=True)
+#        print(type(messages[0]))
+#        sys.exit(1)
+#        message_set = ','.join(messages)
+        print(repr(messages))
+        print(type(messages))
+        print(len(messages))
+        if messages[0]  != b'':
+            message_set = b','.join(messages).decode()  # "1,2,3"
+            print("Deleting:", repr(message_set))
+            typ, resp = mail.store(message_set, '+FLAGS', r'(\Deleted)')
+            print("STORE:", typ, resp)
+
+#            if typ == 'OK':
+#                mail.expunge()
+
+       # mail.store(messages, '+FLAGS', '\\Deleted')
+        rows.append({'Email': email, 'Count': len(messages)})
+    summary = pd.DataFrame(rows)
     return summary
 
 def main():
-    credentials = load_credentials(argv[1])
+    credentials = load_credentials()
     mail = connect_to_gmail_imap(*credentials)
-    summary = get_emails_to_delete(mail, 'path_to_email_list.json')
+    summary = get_emails_to_delete(mail, 'delete_list.json')
     print(summary)
     
 if __name__ == "__main__":
