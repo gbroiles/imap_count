@@ -3,9 +3,9 @@ import imaplib
 import os
 import sys
 import socket
+from tqdm import tqdm
 
-def move_to_trash_explicit():
-    # 1. Validate inputs and environment
+def move_to_trash_explicit_fast():
     if len(sys.argv) < 3:
         print("Usage: python3 script.py <sender_email> <mailbox_name>", file=sys.stderr)
         sys.exit(1)
@@ -21,28 +21,26 @@ def move_to_trash_explicit():
         sys.exit(1)
 
     mail = None
+    success_count = 0
+
     try:
-        # 2. Handle Network Connection
         try:
             mail = imaplib.IMAP4_SSL('imap.gmail.com')
         except socket.error as e:
             print(f"Network error: Could not connect to IMAP server. Details: {e}", file=sys.stderr)
             sys.exit(1)
 
-        # 3. Handle Authentication
         try:
             mail.login(user, password)
         except imaplib.IMAP4.error as e:
-            print(f"Authentication failed. Verify credentials or App Password. Details: {e}", file=sys.stderr)
+            print(f"Authentication failed. Details: {e}", file=sys.stderr)
             sys.exit(1)
 
-        # 4. Handle Mailbox Selection
         status, _ = mail.select(f'"{source_mailbox}"')
         if status != 'OK':
-            print(f"Error: Could not select mailbox '{source_mailbox}'. Verify the mailbox exists.", file=sys.stderr)
+            print(f"Error: Could not select mailbox '{source_mailbox}'.", file=sys.stderr)
             return
 
-        # 5. Handle Search
         search_criterion = f'(FROM "{sender_email}")'
         status, data = mail.search(None, search_criterion)
         
@@ -51,44 +49,56 @@ def move_to_trash_explicit():
             return
 
         mail_ids = data[0].split()
+        total_emails = len(mail_ids)
+        
         if not mail_ids:
             print(f"No emails found from {sender_email} in {source_mailbox}.")
             return
 
-        print(f"Found {len(mail_ids)} emails. Moving to [Gmail]/Trash...")
+        print(f"Found {total_emails} emails. Moving to [Gmail]/Trash in batches...")
 
         trash_folder = '"[Gmail]/Trash"'
-        success_count = 0
+        chunk_size = 100 
         
-        # 6. Handle Individual Message Operations
-        for m_id in mail_ids:
-            try:
-                copy_status, _ = mail.copy(m_id, trash_folder)
+        with tqdm(total=total_emails, desc="Processing", unit="msg") as pbar:
+            for i in range(0, total_emails, chunk_size):
+                chunk = mail_ids[i:i + chunk_size]
+                id_str = b','.join(chunk)
                 
-                if copy_status == 'OK':
-                    store_status, _ = mail.store(m_id, '+FLAGS', '\\Deleted')
-                    if store_status == 'OK':
-                        success_count += 1
+                try:
+                    copy_status, _ = mail.copy(id_str, trash_folder)
+                    
+                    if copy_status == 'OK':
+                        store_status, _ = mail.store(id_str, '+FLAGS', '\\Deleted')
+                        if store_status == 'OK':
+                            success_count += len(chunk)
+                        else:
+                            tqdm.write("Warning: Failed to flag a batch as \\Deleted.", file=sys.stderr)
                     else:
-                        print(f"Warning: Failed to flag message ID {m_id.decode()} as \\Deleted.", file=sys.stderr)
-                else:
-                    print(f"Warning: Failed to copy message ID {m_id.decode()} to Trash. Verify '{trash_folder}' exists.", file=sys.stderr)
-            
-            except imaplib.IMAP4.error as e:
-                print(f"IMAP error processing message ID {m_id.decode()}: {e}", file=sys.stderr)
+                        tqdm.write(f"Warning: Failed to copy a batch to Trash. Verify '{trash_folder}' exists.", file=sys.stderr)
+                
+                except imaplib.IMAP4.error as e:
+                    tqdm.write(f"IMAP error processing batch: {e}", file=sys.stderr)
+                
+                pbar.update(len(chunk))
 
-        # 7. Handle Expunge
         if success_count > 0:
+            print("Expunging deleted messages from source mailbox... ", end="", flush=True)
             try:
                 mail.expunge()
-                print(f"Success: {success_count} emails moved to Trash and expunged from {source_mailbox}.")
+                print(f"Done.\nSuccess: {success_count} emails moved to Trash and expunged from {source_mailbox}.")
             except imaplib.IMAP4.error as e:
-                print(f"Error during expunge operation: {e}", file=sys.stderr)
+                print(f"\nError during expunge operation: {e}", file=sys.stderr)
+
+    except KeyboardInterrupt:
+        print("\n\nOperation cancelled by user (Ctrl+C). Exiting gracefully...")
+        if success_count > 0:
+            print(f"Note: {success_count} emails were successfully copied and flagged for deletion.")
+            print("Because the script was interrupted before expunging, these emails may still appear in the source folder until the next expunge operation.")
 
     except Exception as e:
-        print(f"An unexpected critical error occurred: {e}", file=sys.stderr)
+        print(f"\nAn unexpected critical error occurred: {e}", file=sys.stderr)
     
-    # 8. Ensure Clean Disconnect
     finally:
         if mail:
             try:
@@ -99,4 +109,6 @@ def move_to_trash_explicit():
                 pass
 
 if __name__ == "__main__":
-    move_to_trash_explicit()
+    move_to_trash_explicit_fast()
+
+
