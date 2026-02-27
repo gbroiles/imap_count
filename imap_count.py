@@ -12,6 +12,7 @@ from email.utils import parseaddr
 from collections import Counter
 from tqdm import tqdm
 
+imaplib._MAXLINE = 100000000
 CONNECTION_TIMEOUT = 60
 MAX_WORKERS = 5
 CHUNK_SIZE = 1000
