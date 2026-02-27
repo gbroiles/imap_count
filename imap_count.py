@@ -7,6 +7,8 @@ from email.utils import parseaddr
 from collections import Counter
 from tqdm import tqdm
 
+CONNECTION_TIMEOUT = 60
+
 def list_top_senders(username, password, imap_server, folder="INBOX"):
     """
     Connects to an IMAP account, fetches 'From' headers, and returns 
@@ -14,7 +16,7 @@ def list_top_senders(username, password, imap_server, folder="INBOX"):
     """
     try:
         # Connect to the IMAP server securely
-        mail = imaplib.IMAP4_SSL(imap_server)
+        mail = imaplib.IMAP4_SSL(imap_server, timeout=CONNECTION_TIMEOUT)
         mail.login(username, password)
     except imaplib.IMAP4.error as e:
         print(f"Login failed: {e}")
