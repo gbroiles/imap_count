@@ -2,6 +2,7 @@
 import imaplib
 import email
 import os
+import sys
 from email.utils import parseaddr
 from collections import Counter
 from tqdm import tqdm
@@ -77,12 +78,11 @@ def list_top_senders(username, password, imap_server, folder="INBOX"):
         for sender, count in filtered_sorted_senders:
             print(f"{count:4d} | {sender}")
 
-# --- Example Usage ---
 if __name__ == "__main__":
-    # Replace these variables with your actual credentials and server details
     IMAP_HOST = "imap.gmail.com"  # e.g., imap.gmail.com, outlook.office365.com
     USER_EMAIL = os.getenv('GMAIL_ACCT')
     USER_PASS = os.getenv('GMAIL_PASS') # Use an App Password, not your standard password
-    TARGET_FOLDER = "INBOX"
+#    TARGET_FOLDER = "INBOX"
+    TARGET_FOLDER = sys.argv[1]
 
     list_top_senders(USER_EMAIL, USER_PASS, IMAP_HOST, TARGET_FOLDER)
