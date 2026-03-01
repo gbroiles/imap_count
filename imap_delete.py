@@ -91,6 +91,19 @@ def build_combined_from_query(senders):
         query = f'(OR (FROM "{sender}") {query})'
     return query
 
+def compress_uids(uid_list: list[bytes]) -> bytes:
+    ints = sorted([int(u) for u in uid_list])
+    ranges = []
+    start = end = ints[0]
+    for n in ints[1:]:
+        if n == end + 1:
+            end = n
+        else:
+            ranges.append(f"{start}:{end}" if start != end else str(start))
+            start = end = n
+    ranges.append(f"{start}:{end}" if start != end else str(start))
+    return ",".join(ranges).encode()
+
 
 # ---------- Checkpointing ----------
 
@@ -183,7 +196,8 @@ def move_to_trash():
 
         while i < total:
             chunk = uids[i:i + CHUNK_SIZE]
-            uid_str = b",".join(chunk)
+#            uid_str = b",".join(chunk)
+            uid_str = compress_uids(chunk)
 
             for attempt in range(args.retries):
                 try:
