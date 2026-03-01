@@ -12,26 +12,31 @@ from tqdm import tqdm
 
 imaplib.Debug = 0
 
+LOG_FILE = "imap_errors.log"
+
+# --- Secure log file creation (no race window) ---
+def secure_file_handler(path: str):
+    flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+    fd = os.open(path, flags, 0o600)
+    os.close(fd)
+    handler = logging.FileHandler(path)
+    handler.setLevel(logging.WARNING)
+    formatter = logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(message)s"
+    )
+    handler.setFormatter(formatter)
+    return handler
+
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-file_handler = logging.FileHandler("imap_errors.log")
-file_handler.setLevel(logging.WARNING)
-file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-file_handler.setFormatter(file_formatter)
+logger.addHandler(secure_file_handler(LOG_FILE))
 
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
-console_formatter = logging.Formatter('%(message)s')
-console_handler.setFormatter(console_formatter)
-
-logger.addHandler(file_handler)
+console_handler.setFormatter(logging.Formatter("%(message)s"))
 logger.addHandler(console_handler)
-
-try:
-    os.chmod("imap_errors.log", stat.S_IRUSR | stat.S_IWUSR)
-except OSError:
-    pass
 
 
 EMAIL_REGEX = r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$'
@@ -53,7 +58,9 @@ def load_senders_from_file(path: str):
             if not sender:
                 continue
             if not validate_sender(sender):
-                raise ValueError(f"Invalid email format on line {line_no}: {sender}")
+                raise ValueError(
+                    f"Invalid email format on line {line_no}: {sender}"
+                )
             senders.add(sender)
 
     if not senders:
@@ -64,22 +71,42 @@ def load_senders_from_file(path: str):
 
 def find_trash_folder(mail):
     status, mailboxes = mail.list()
-    if status != 'OK':
+    if status != "OK":
         raise RuntimeError("Unable to list mailboxes.")
 
     for mbox in mailboxes:
-        decoded = mbox.decode()
-        if '\\Trash' in decoded:
-            return decoded.split(' "/" ')[-1].strip('"')
+        decoded = mbox.decode(errors="replace")
+        if "\\Trash" in decoded:
+            # Extract mailbox name safely
+            parts = decoded.split(' "/" ')
+            if len(parts) == 2:
+                return parts[1].strip('"')
 
     raise RuntimeError("No mailbox with \\Trash flag found.")
 
 
+# --- Hardened IMAP search query construction ---
+def build_combined_from_query(senders):
+    # Escape quotes defensively
+    escaped = [s.replace('"', r'\"') for s in senders]
+
+    if len(escaped) == 1:
+        return f'(FROM "{escaped[0]}")'
+
+    # Build nested OR tree: OR (FROM A) (OR (FROM B) (FROM C))
+    query = f'(FROM "{escaped[-1]}")'
+    for sender in reversed(escaped[:-1]):
+        query = f'(OR (FROM "{sender}") {query})'
+    return query
+
+
 def move_to_trash():
-    parser = argparse.ArgumentParser(description="Move emails from sender(s) to Trash.")
+    parser = argparse.ArgumentParser(
+        description="Move emails from sender(s) to Trash."
+    )
     parser.add_argument("mailbox")
-    parser.add_argument("sender", nargs="?", help="Single sender email address")
-    parser.add_argument("--file", help="Path to file containing sender email addresses")
+    parser.add_argument("sender", nargs="?")
+    parser.add_argument("--file")
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--delay", type=float, default=2.0)
     parser.add_argument("--timeout", type=float, default=30.0)
@@ -92,7 +119,7 @@ def move_to_trash():
         sys.exit(1)
 
     if args.sender and args.file:
-        logger.error("Provide either a sender email OR --file, not both.")
+        logger.error("Provide either a sender email OR --file.")
         sys.exit(1)
 
     try:
@@ -134,68 +161,75 @@ def move_to_trash():
             logger.error(f"Cannot select mailbox '{args.mailbox}'.")
             return
 
-        all_uids = set()
+        search_query = build_combined_from_query(senders)
 
-        for sender in senders:
-            status, data = mail.uid("search", None, "FROM", sender)
-            if status != "OK":
-                logger.warning(f"Search failed for sender: {sender}")
-                continue
+        status, data = mail.uid("search", None, search_query)
+        if status != "OK":
+            logger.error("Search failed.")
+            return
 
-            uids = data[0].split()
-            all_uids.update(uids)
-
-        total = len(all_uids)
-
-        if total == 0:
+        if not data or not data[0]:
             logger.info("No matching messages found.")
             return
 
+        all_uids = data[0].split()
+        total = len(all_uids)
+
         if args.dry_run:
-            logger.info(f"[DRY RUN] {total} unique messages would be moved.")
+            logger.info(f"[DRY RUN] {total} messages would be moved.")
             return
 
         trash_folder = find_trash_folder(mail)
+        mail.capability()
         supports_move = b"MOVE" in mail.capabilities
+
         chunk_size = 100
-        uid_list = sorted(all_uids)
 
         logger.info(f"Moving {total} messages to '{trash_folder}'")
 
         with tqdm(total=total, unit="msg") as pbar:
             for i in range(0, total, chunk_size):
-                chunk = uid_list[i:i + chunk_size]
+                chunk = all_uids[i:i + chunk_size]
                 uid_str = b",".join(chunk)
 
                 for attempt in range(args.retries):
                     try:
                         if supports_move:
-                            status, _ = mail.uid("MOVE", uid_str, trash_folder)
-                            if status == "OK":
-                                success_count += len(chunk)
-                                break
+                            status, _ = mail.uid(
+                                "MOVE", uid_str, trash_folder
+                            )
+                            if status != "OK":
+                                raise RuntimeError("MOVE failed")
                         else:
-                            c_status, _ = mail.uid("COPY", uid_str, trash_folder)
+                            c_status, _ = mail.uid(
+                                "COPY", uid_str, trash_folder
+                            )
                             if c_status != "OK":
                                 raise RuntimeError("COPY failed")
 
-                            s_status, _ = mail.uid("STORE", uid_str, "+FLAGS", r"\Deleted")
+                            s_status, _ = mail.uid(
+                                "STORE",
+                                uid_str,
+                                "+FLAGS",
+                                r"\Deleted",
+                            )
                             if s_status != "OK":
                                 raise RuntimeError("STORE failed")
 
-                            success_count += len(chunk)
-                            break
+                        success_count += len(chunk)
+                        break
 
                     except Exception as e:
                         if attempt == args.retries - 1:
-                            logger.error(f"Batch {i//chunk_size} failed: {e}")
+                            logger.error(
+                                f"Batch {i//chunk_size} failed: {e}"
+                            )
                         else:
                             time.sleep(args.delay)
 
                 pbar.update(len(chunk))
 
         if not supports_move and success_count > 0:
-            logger.info("Expunging deleted messages...")
             mail.expunge()
 
         logger.info(f"Completed. {success_count} messages moved.")
@@ -216,4 +250,3 @@ def move_to_trash():
 
 if __name__ == "__main__":
     move_to_trash()
-
