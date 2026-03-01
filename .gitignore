@@ -208,5 +208,5 @@ __marimo__/
 
 *.txt
 *.old
-delete_list.json
+*.json
 *.log
