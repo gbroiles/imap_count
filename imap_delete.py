@@ -41,6 +41,27 @@ def validate_sender(sender: str) -> bool:
     return bool(re.fullmatch(EMAIL_REGEX, sender))
 
 
+def load_senders_from_file(path: str):
+    if not os.path.isfile(path):
+        raise ValueError("Sender file does not exist.")
+
+    senders = set()
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, 1):
+            sender = line.strip()
+            if not sender:
+                continue
+            if not validate_sender(sender):
+                raise ValueError(f"Invalid email format on line {line_no}: {sender}")
+            senders.add(sender)
+
+    if not senders:
+        raise ValueError("Sender file contains no valid email addresses.")
+
+    return sorted(senders)
+
+
 def find_trash_folder(mail):
     status, mailboxes = mail.list()
     if status != 'OK':
@@ -49,15 +70,16 @@ def find_trash_folder(mail):
     for mbox in mailboxes:
         decoded = mbox.decode()
         if '\\Trash' in decoded:
-            # Mailbox name is last quoted string
             return decoded.split(' "/" ')[-1].strip('"')
+
     raise RuntimeError("No mailbox with \\Trash flag found.")
 
 
 def move_to_trash():
-    parser = argparse.ArgumentParser(description="Move emails from a specific sender to Trash.")
+    parser = argparse.ArgumentParser(description="Move emails from sender(s) to Trash.")
     parser.add_argument("mailbox")
-    parser.add_argument("sender")
+    parser.add_argument("sender", nargs="?", help="Single sender email address")
+    parser.add_argument("--file", help="Path to file containing sender email addresses")
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--delay", type=float, default=2.0)
     parser.add_argument("--timeout", type=float, default=30.0)
@@ -65,8 +87,24 @@ def move_to_trash():
 
     args = parser.parse_args()
 
-    if not validate_sender(args.sender):
-        logger.error("Invalid sender email format.")
+    if not args.sender and not args.file:
+        logger.error("Provide either a sender email or --file.")
+        sys.exit(1)
+
+    if args.sender and args.file:
+        logger.error("Provide either a sender email OR --file, not both.")
+        sys.exit(1)
+
+    try:
+        if args.file:
+            senders = load_senders_from_file(args.file)
+        else:
+            if not validate_sender(args.sender):
+                logger.error("Invalid sender email format.")
+                sys.exit(1)
+            senders = [args.sender]
+    except ValueError as e:
+        logger.error(str(e))
         sys.exit(1)
 
     user = os.getenv("GMAIL_ACCT")
@@ -96,31 +134,37 @@ def move_to_trash():
             logger.error(f"Cannot select mailbox '{args.mailbox}'.")
             return
 
-        status, data = mail.uid("search", None, "FROM", args.sender)
-        if status != "OK":
-            logger.error("Search failed.")
-            return
+        all_uids = set()
 
-        uids = data[0].split()
-        total = len(uids)
+        for sender in senders:
+            status, data = mail.uid("search", None, "FROM", sender)
+            if status != "OK":
+                logger.warning(f"Search failed for sender: {sender}")
+                continue
+
+            uids = data[0].split()
+            all_uids.update(uids)
+
+        total = len(all_uids)
 
         if total == 0:
             logger.info("No matching messages found.")
             return
 
         if args.dry_run:
-            logger.info(f"[DRY RUN] {total} messages would be moved.")
+            logger.info(f"[DRY RUN] {total} unique messages would be moved.")
             return
 
         trash_folder = find_trash_folder(mail)
-        logger.info(f"Moving {total} messages to '{trash_folder}'")
-
         supports_move = b"MOVE" in mail.capabilities
         chunk_size = 100
+        uid_list = sorted(all_uids)
+
+        logger.info(f"Moving {total} messages to '{trash_folder}'")
 
         with tqdm(total=total, unit="msg") as pbar:
             for i in range(0, total, chunk_size):
-                chunk = uids[i:i + chunk_size]
+                chunk = uid_list[i:i + chunk_size]
                 uid_str = b",".join(chunk)
 
                 for attempt in range(args.retries):
@@ -131,7 +175,6 @@ def move_to_trash():
                                 success_count += len(chunk)
                                 break
                         else:
-                            # Fallback: COPY + STORE
                             c_status, _ = mail.uid("COPY", uid_str, trash_folder)
                             if c_status != "OK":
                                 raise RuntimeError("COPY failed")
