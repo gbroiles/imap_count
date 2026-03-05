@@ -8,6 +8,7 @@ import threading
 import concurrent.futures
 import signal
 import logging
+import argparse
 from email.utils import parseaddr
 from collections import Counter
 from tqdm import tqdm
@@ -227,18 +228,20 @@ def list_top_senders(username, password, imap_server, folder="INBOX"):
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     
-    IMAP_HOST = "imap.gmail.com"
-    USER_EMAIL = os.getenv('GMAIL_ACCT')
-    USER_PASS = os.getenv('GMAIL_PASS')
+    parser = argparse.ArgumentParser(description="Count top senders in a specific IMAP folder.")
+    parser.add_argument("folder", help="Target IMAP folder to scan (e.g., INBOX)")
+    parser.add_argument("-u", "--user", default=os.getenv('GMAIL_ACCT'), help="IMAP username (defaults to GMAIL_ACCT env var)")
+    parser.add_argument("-p", "--password", default=os.getenv('GMAIL_PASS'), help="IMAP password (defaults to GMAIL_PASS env var)")
+    parser.add_argument("-s", "--server", default="imap.gmail.com", help="IMAP server (defaults to imap.gmail.com)")
     
-    if len(sys.argv) > 1:
-        TARGET_FOLDER = sys.argv[1]
-    else:
-        print("Usage: python3 imap_count.py <TARGET_FOLDER>")
+    args = parser.parse_args()
+
+    if not args.user or not args.password:
+        print("Error: Username and password must be provided via command-line arguments or environment variables.")
         sys.exit(1)
 
-    logging.info(f"Script started. Target folder: {TARGET_FOLDER}")
-    list_top_senders(USER_EMAIL, USER_PASS, IMAP_HOST, TARGET_FOLDER)
+    logging.info(f"Script started. Server: {args.server}, Target folder: {args.folder}")
+    list_top_senders(args.user, args.password, args.server, args.folder)
     logging.info("Script execution finished.")
 
 
