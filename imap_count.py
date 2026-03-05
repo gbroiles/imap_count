@@ -70,6 +70,7 @@ class ResilientIMAP:
                 self.mail.select(self.current_folder, readonly=self.readonly)
         except Exception as e:
             logging.error(f"Connection failed: {e}")
+            raise ConnectionError(f"Failed to connect to {self.host}") from e
 
     def select(self, folder, readonly=False):
         self.current_folder = folder
@@ -179,7 +180,7 @@ def list_top_senders(username, password, imap_server, folder="INBOX"):
         main_conn.logout()
     except Exception as e:
         logging.critical(f"Fatal initialization error: {e}")
-        print("Fatal error during initialization. Check logs.")
+        print(f"Fatal error during initialization: {e}. Check logs.")
         return
 
     logging.info(f"Starting to process {len(email_ids)} messages across {MAX_WORKERS} threads.")
@@ -243,5 +244,4 @@ if __name__ == "__main__":
     logging.info(f"Script started. Server: {args.server}, Target folder: {args.folder}")
     list_top_senders(args.user, args.password, args.server, args.folder)
     logging.info("Script execution finished.")
-
 
