@@ -79,7 +79,9 @@ class ResilientIMAP:
     def select(self, folder, readonly=False):
         self.current_folder = folder
         self.readonly = readonly
-        return self.mail.select(f'"{folder}"', readonly=readonly)
+        # Strip any stray quotes the user may have typed before re-quoting.
+        safe = folder.strip('"')
+        return self.mail.select(f'"{safe}"', readonly=readonly)
 
     def _retry(self, op_name, *args, **kwargs):
         last_exc = RuntimeError(f"Operation '{op_name}' failed after retries")
@@ -125,17 +127,35 @@ class ResilientIMAP:
 
 
 def find_trash_folder(mail: ResilientIMAP) -> str:
-    """Locate the server's Trash mailbox name."""
+    """Locate the server's Trash mailbox name.
+
+    Prefers the RFC 6154 \\Trash SPECIAL-USE flag; falls back to a
+    case-insensitive name heuristic.
+    """
     status, boxes = mail.list()
     if status != "OK":
         raise RuntimeError("Unable to list mailboxes")
+
+    def _extract_name(decoded: str) -> str:
+        """Return the folder name from a decoded LIST response line."""
+        if '"' in decoded:
+            return decoded.split('"')[-2]
+        return decoded.split()[-1]
+
+    name_match = None
     for raw in boxes:
         decoded = raw.decode("utf-8", errors="replace")
-        if "trash" in decoded.lower():
-            # The folder name is the last quoted token (or last token after the delimiter).
-            if '"' in decoded:
-                return decoded.split('"')[-2]
-            return decoded.split()[-1]
+        # Flags live inside the first set of parentheses, e.g. (\HasNoChildren \Trash).
+        flags_match = re.match(r"\(([^)]*)\)", decoded)
+        if flags_match:
+            flags = flags_match.group(1).lower()
+            if r"\trash" in flags:
+                return _extract_name(decoded)
+        if name_match is None and "trash" in decoded.lower():
+            name_match = _extract_name(decoded)
+
+    if name_match:
+        return name_match
     raise RuntimeError("Trash folder not found on server")
 
 
@@ -267,28 +287,35 @@ def make_ignore_predicate(rules):
 
 
 _thread_local = threading.local()
-_open_connections = []
+_open_connections: set = set()  # set allows O(1) membership check
 _open_connections_lock = threading.Lock()
 
 
 def _get_thread_connection(server, user, password, folder, readonly):
-    if not hasattr(_thread_local, "conn"):
+    conn = getattr(_thread_local, "conn", None)
+    # Re-create if absent or if the connection was closed by a previous operation
+    # (a recycled thread from an old executor will have a stale, logged-out conn
+    # that has already been removed from _open_connections).
+    with _open_connections_lock:
+        valid = conn is not None and conn in _open_connections
+    if not valid:
         conn = ResilientIMAP(server, user, password)
         conn.select(folder, readonly=readonly)
         _thread_local.conn = conn
         with _open_connections_lock:
-            _open_connections.append(conn)
-    return _thread_local.conn
+            _open_connections.add(conn)
+    return conn
 
 
 def _close_all_thread_connections():
     with _open_connections_lock:
-        for conn in _open_connections:
-            try:
-                conn.logout()
-            except Exception:
-                pass
+        conns = list(_open_connections)
         _open_connections.clear()
+    for conn in conns:
+        try:
+            conn.logout()
+        except Exception:
+            pass
 
 
 # ---------- Fetch / Delete worker functions ----------
@@ -632,6 +659,8 @@ class SenderManagerApp:
         self.cancel_flag = threading.Event()
         self.event_q: queue.Queue = queue.Queue()
         self.op_in_progress = False
+        self._progress_max = 1
+        self._progress_val = 0
 
         self.root.title("IMAP Sender Manager")
         self.root.geometry("760x560")
@@ -741,11 +770,11 @@ class SenderManagerApp:
         if not row:
             return
         col = self.tree.identify_column(event.x)
+        if col != "#1":
+            return
         email_addr = self.row_email.get(row)
         if email_addr is None:
             return
-        # Clicking anywhere on the row toggles the checkbox (mirrors the
-        # first-column click behaviour and is friendlier on touchpads).
         if email_addr in self.checked:
             self.checked.discard(email_addr)
             glyph = CHECK_OFF
@@ -864,9 +893,12 @@ class SenderManagerApp:
         if kind == "status":
             self.status_var.set(payload)
         elif kind == "progress_init":
-            self.progress.configure(value=0, maximum=max(1, payload))
+            self._progress_max = max(1, payload)
+            self._progress_val = 0
+            self.progress.configure(value=0, maximum=self._progress_max)
         elif kind == "progress":
-            self.progress.step(payload)
+            self._progress_val = min(self._progress_val + payload, self._progress_max)
+            self.progress.configure(value=self._progress_val)
         elif kind == "fetch_done":
             records, total = payload
             self._on_fetch_done(records, total)
