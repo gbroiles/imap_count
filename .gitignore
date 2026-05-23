@@ -210,3 +210,6 @@ __marimo__/
 *.old
 *.json
 *.log
+
+# Local IMAP credentials for the GUI (imap.ini.example is the template).
+imap.ini

@@ -1,0 +1,10 @@
+[imap]
+server = imap.gmail.com
+username = me@example.com
+password = your-app-password
+folder = INBOX
+# Comma- or whitespace-separated list. Entries may be a full email
+# (boss@work.com), a bare domain (newsletters.example.com), or a domain
+# with a leading @ (@notifications.example.com). Matching is
+# case-insensitive and applies to the sender of each message.
+ignore = boss@work.com, @alerts.example.com
