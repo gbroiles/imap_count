@@ -9,6 +9,7 @@ import concurrent.futures
 import signal
 import logging
 import argparse
+from email import message_from_bytes
 from email.utils import parseaddr
 from collections import Counter
 from tqdm import tqdm
@@ -26,20 +27,11 @@ logging.basicConfig(
 )
 
 shutdown_flag = threading.Event()
-active_connections = []
-connection_lock = threading.Lock()
 
 def signal_handler(sig, frame):
-    logging.warning("Interrupt received. Gracefully shutting down connections...")
+    logging.warning("Interrupt received. Gracefully shutting down...")
     print("\nInterrupt received. Halting and cleaning up...")
     shutdown_flag.set()
-    
-    with connection_lock:
-        for conn in active_connections:
-            try:
-                conn.logout()
-            except Exception as e:
-                logging.debug(f"Error during shutdown logout: {e}")
     sys.exit(0)
 
 class ResilientIMAP:
@@ -78,7 +70,7 @@ class ResilientIMAP:
         return self.mail.select(folder, readonly=readonly)
 
     def _retry_operation(self, op_name, *args, **kwargs):
-        last_exception = None
+        last_exception = RuntimeError(f"Operation '{op_name}' failed after all retries")
         for attempt in range(self.retries):
             if shutdown_flag.is_set():
                 return 'ABORT', []
@@ -122,10 +114,6 @@ def get_thread_connection(host, user, password, folder):
         conn = ResilientIMAP(host, user, password, timeout=CONNECTION_TIMEOUT)
         conn.select(folder, readonly=True)
         thread_local.mail = conn
-        
-        with connection_lock:
-            active_connections.append(conn)
-            
     return thread_local.mail
 
 def fetch_chunk(chunk, host, user, password, folder):
@@ -143,11 +131,10 @@ def fetch_chunk(chunk, host, user, password, folder):
             for response_part in msg_data:
                 if isinstance(response_part, tuple):
                     try:
-                        header_str = response_part[1].decode('utf-8', errors='ignore')
-                        if header_str.lower().startswith('from:'):
-                            name, email_address = parseaddr(header_str[5:])
-                            if email_address:
-                                senders.append(email_address.lower())
+                        msg = message_from_bytes(response_part[1])
+                        _, email_address = parseaddr(msg.get('From', ''))
+                        if email_address:
+                            senders.append(email_address.lower())
                     except Exception as e:
                         logging.debug(f"Failed to parse header: {e}")
                         continue
@@ -206,12 +193,7 @@ def list_top_senders(username, password, imap_server, folder="INBOX"):
                 
                 pbar.update(len(chunk))
 
-    if not shutdown_flag.is_set():
-        logging.info("Processing complete. Cleaning up connections.")
-        with connection_lock:
-            for conn in active_connections:
-                conn.logout()
-
+    logging.info("Processing complete.")
     sender_counts = Counter(all_senders)
     filtered_sorted_senders = sorted(
         [(sender, count) for sender, count in sender_counts.items() if count > 1],
