@@ -81,7 +81,7 @@ def connect_and_select(server, user, password, mailbox, timeout):
 
 def get_thread_connection(server, user, password, folder, timeout):
     if not hasattr(thread_local, "mail"):
-        logger.info("Initializing new thread-local IMAP connection.")
+        logger.debug("Initializing new thread-local IMAP connection.")
         conn = connect_and_select(server, user, password, folder, timeout)
         thread_local.mail = conn
         with connection_lock:
@@ -191,12 +191,14 @@ def build_gmail_raw_query(args):
     return " ".join(parts)
 
 def run_standard_search(mail, query):
+    logger.debug(f"Running IMAP SEARCH: {query}")
     status, data = mail.uid("search", None, query)
     if status != "OK" or not data or not data[0]:
         return []
     return data[0].split()
 
 def run_gmail_search(mail, raw_query):
+    logger.debug(f"Running GMAIL RAW SEARCH: {raw_query}")
     status, data = mail.uid("search", "X-GM-RAW", f'"{raw_query}"')
     if status != "OK" or not data or not data[0]:
         return []
@@ -204,11 +206,10 @@ def run_gmail_search(mail, raw_query):
 
 # ---------- Worker Thread ----------
 
-def process_chunk(chunk_uids, trash_folder, supports_move, args, server):
+def process_chunk(chunk_uids, trash_folder, supports_move, args, server, pbar):
     if shutdown_flag.is_set():
-        return 0
+        return
 
-    processed = 0
     current_chunk_size = args.chunk_size
     i = 0
     
@@ -228,39 +229,41 @@ def process_chunk(chunk_uids, trash_folder, supports_move, args, server):
 
             try:
                 if supports_move:
+                    logger.debug(f"Executing MOVE for {len(sub_chunk)} items. Attempt {attempt + 1}")
                     status, response = mail.uid("MOVE", uid_str, quoted_trash)
                     if status != "OK":
                         raise RuntimeError(f"MOVE failed: {response}")
                 else:
+                    logger.debug(f"Executing COPY for {len(sub_chunk)} items. Attempt {attempt + 1}")
                     status, response = mail.uid("COPY", uid_str, quoted_trash)
                     if status != "OK":
                         raise RuntimeError(f"COPY failed: {response}")
 
+                    logger.debug(f"Executing STORE (Delete Flag) for {len(sub_chunk)} items.")
                     status, response = mail.uid("STORE", uid_str, "+FLAGS", r"\Deleted")
                     if status != "OK":
                         raise RuntimeError(f"STORE failed: {response}")
 
                 i += len(sub_chunk)
-                processed += len(sub_chunk)
+                pbar.update(len(sub_chunk))
                 
                 if args.chunk_delay > 0:
                     time.sleep(args.chunk_delay)
                 break
 
-            except (imaplib.IMAP4.abort, ssl.SSLError, socket.error):
+            except (imaplib.IMAP4.abort, ssl.SSLError, socket.error) as e:
                 delay = exponential_backoff(attempt, args.delay)
-                logger.warning(f"Connection lost. Retrying in {delay}s.")
+                logger.warning(f"Connection lost ({e}). Retrying in {delay}s.")
                 wait_with_progress(delay, f"Reconnecting ({delay}s)")
                 
                 try:
                     mail = connect_and_select(server, args.user, args.password, args.folder, args.timeout)
                     thread_local.mail = mail
-                    # Update active connections list safely
                     with connection_lock:
                         if mail not in active_connections:
                             active_connections.append(mail)
-                except Exception as e:
-                    logger.error(f"Reconnection failed: {e}")
+                except Exception as reconnect_e:
+                    logger.error(f"Reconnection failed: {reconnect_e}")
 
             except Exception as e:
                 error_msg = str(e)
@@ -277,14 +280,12 @@ def process_chunk(chunk_uids, trash_folder, supports_move, args, server):
                     
                     if attempt == args.retries - 1:
                         logger.error(f"Exhausted retries due to rate limits: {error_msg}")
-                        return processed 
+                        return
                 else:
                     if attempt == args.retries - 1:
                         logger.error(f"Failed to process chunk: {error_msg}")
-                        return processed
+                        return
                     wait_with_progress(args.delay, f"Retrying ({args.delay}s)")
-
-    return processed
 
 def expunge_with_retry(main_mail, server, args):
     for attempt in range(args.retries):
@@ -328,10 +329,18 @@ def move_to_trash():
     parser.add_argument("--delay", type=float, default=2.0)
     parser.add_argument("--retries", type=int, default=5)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--chunk-size", type=int, default=100, help="Number of emails to move per request")
+    parser.add_argument("--chunk-size", type=int, default=None, help="Number of emails to move per request")
     parser.add_argument("--chunk-delay", type=float, default=1.0, help="Seconds to wait between chunks to avoid rate limits")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debugging output")
 
     args = parser.parse_args()
+
+    # Apply verbose logging
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+        for handler in logger.handlers:
+            handler.setLevel(logging.DEBUG)
+        logger.debug("Verbose logging enabled.")
 
     if not args.user or not args.password:
         sys.exit("Error: Username and password must be provided via command-line arguments or environment variables.")
@@ -339,66 +348,91 @@ def move_to_trash():
     server = args.server.lower()
     is_gmail = "gmail" in server
 
-    # Determine thread count
-    if args.threads is not None:
-        max_workers = args.threads
-    elif "yahoo" in server:
-        max_workers = 3
-    elif "gmail" in server:
-        max_workers = 10
-    else:
-        max_workers = 1
+    # Apply defaults if missing
+    if args.threads is None:
+        if "yahoo" in server:
+            args.threads = 3
+        elif "gmail" in server:
+            args.threads = 10
+        else:
+            args.threads = 1
+
+    if args.chunk_size is None:
+        args.chunk_size = 12 if "yahoo" in server else 100
+
+    logger.debug(f"Configuration: Threads={args.threads}, Chunk Size={args.chunk_size}, Delay={args.chunk_delay}s")
 
     # Main connection for initial setup
     main_mail = connect_and_select(server, args.user, args.password, args.folder, args.timeout)
     trash_folder = find_trash_folder(main_mail)
     supports_move = b"MOVE" in main_mail.capabilities
+    logger.debug(f"Trash folder mapped to: {trash_folder}. Server supports MOVE: {supports_move}")
 
     if is_gmail:
         search_query = build_gmail_raw_query(args)
-        uids = run_gmail_search(main_mail, search_query)
     else:
         search_query = build_standard_search(args)
-        uids = run_standard_search(main_mail, search_query)
 
-    total = len(uids)
+    pass_number = 1
 
-    if total == 0:
-        logger.info("No matching messages.")
-        main_mail.logout()
-        return
+    while not shutdown_flag.is_set():
+        try:
+            if is_gmail:
+                uids = run_gmail_search(main_mail, search_query)
+            else:
+                uids = run_standard_search(main_mail, search_query)
+        except (imaplib.IMAP4.abort, ssl.SSLError, socket.error) as e:
+            logger.warning(f"Main connection lost during search ({e}). Reconnecting...")
+            try:
+                main_mail = connect_and_select(server, args.user, args.password, args.folder, args.timeout)
+                continue
+            except Exception as reconnect_e:
+                logger.error(f"Failed to reconnect main mail instance: {reconnect_e}")
+                break
+        except Exception as e:
+            logger.error(f"Search failed: {e}")
+            break
 
-    if args.dry_run:
-        logger.info(f"[DRY RUN] {total} messages would be moved.")
-        main_mail.logout()
-        return
+        total = len(uids)
 
-    logger.info(f"Processing {total} messages using {max_workers} threads...")
-    
-    # Split total UIDs evenly among threads
-    chunk_size = max(1, len(uids) // max_workers)
-    chunks = [uids[i:i + chunk_size] for i in range(0, len(uids), chunk_size)]
+        if total == 0:
+            if pass_number == 1:
+                logger.info("No matching messages.")
+            else:
+                logger.info(f"Pass {pass_number}: 0 messages found. Processing complete.")
+            break
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(process_chunk, chunk, trash_folder, supports_move, args, server): chunk 
-            for chunk in chunks
-        }
+        if args.dry_run:
+            logger.info(f"[DRY RUN] {total} messages would be moved.")
+            break
+
+        logger.info(f"Pass {pass_number}: Processing {total} messages using {args.threads} threads...")
         
-        with tqdm(total=total, unit="msg") as pbar:
-            for future in concurrent.futures.as_completed(futures):
-                if shutdown_flag.is_set():
-                    break
-                try:
-                    processed_count = future.result()
-                    pbar.update(processed_count)
-                except Exception as e:
-                    logger.error(f"Thread execution failed: {e}")
+        # Split total UIDs evenly among threads
+        chunk_size = max(1, len(uids) // args.threads)
+        chunks = [uids[i:i + chunk_size] for i in range(0, len(uids), chunk_size)]
 
-    # Expunge only on the main thread after all workers finish
-    if not supports_move and not shutdown_flag.is_set():
-        logger.info("Expunging deleted messages...")
-        main_mail = expunge_with_retry(main_mail, server, args)
+        with tqdm(total=total, unit="msg", desc=f"Pass {pass_number}") as pbar:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
+                futures = {
+                    executor.submit(process_chunk, chunk, trash_folder, supports_move, args, server, pbar): chunk
+                    for chunk in chunks
+                }
+
+                for future in concurrent.futures.as_completed(futures):
+                    if shutdown_flag.is_set():
+                        break
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error(f"Thread execution failed: {e}")
+
+        # Expunge on the main thread after all workers finish the current pass
+        if not supports_move and not shutdown_flag.is_set():
+            logger.info("Expunging deleted messages to finalize pass...")
+            main_mail = expunge_with_retry(main_mail, server, args)
+
+        pass_number += 1
 
     # Cleanup all connections
     with connection_lock:
@@ -417,5 +451,5 @@ def move_to_trash():
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     move_to_trash()
-    
+
 
