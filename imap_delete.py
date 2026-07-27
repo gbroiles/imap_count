@@ -286,6 +286,32 @@ def process_chunk(chunk_uids, trash_folder, supports_move, args, server):
 
     return processed
 
+def expunge_with_retry(main_mail, server, args):
+    for attempt in range(args.retries):
+        if shutdown_flag.is_set():
+            return main_mail
+
+        try:
+            main_mail.expunge()
+            return main_mail
+        except (imaplib.IMAP4.abort, ssl.SSLError, socket.error):
+            delay = exponential_backoff(attempt, args.delay)
+            logger.warning(f"Connection lost before expunge. Retrying in {delay}s.")
+            wait_with_progress(delay, f"Reconnecting ({delay}s)")
+
+            if shutdown_flag.is_set():
+                return main_mail
+
+            try:
+                main_mail = connect_and_select(
+                    server, args.user, args.password, args.folder, args.timeout
+                )
+            except Exception as e:
+                logger.error(f"Reconnection failed: {e}")
+
+    logger.error("Failed to expunge deleted messages after exhausting retries.")
+    return main_mail
+
 # ---------- Main ----------
 
 def move_to_trash():
@@ -372,7 +398,7 @@ def move_to_trash():
     # Expunge only on the main thread after all workers finish
     if not supports_move and not shutdown_flag.is_set():
         logger.info("Expunging deleted messages...")
-        main_mail.expunge()
+        main_mail = expunge_with_retry(main_mail, server, args)
 
     # Cleanup all connections
     with connection_lock:
@@ -381,8 +407,11 @@ def move_to_trash():
                 conn.logout()
             except Exception:
                 pass
-                
-    main_mail.logout()
+
+    try:
+        main_mail.logout()
+    except Exception:
+        pass
     logger.info("Completed.")
 
 if __name__ == "__main__":
