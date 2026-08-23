@@ -3,6 +3,9 @@ import imaplib
 import os
 import sys
 
+from imap_common import imap_login
+
+
 def get_gmail_folders():
     # Retrieve credentials from environment variables
     user = os.getenv('GMAIL_ACCT')
@@ -14,9 +17,8 @@ def get_gmail_folders():
 
     try:
         # Connect to Gmail's IMAP server
-        mail = imaplib.IMAP4_SSL('imap.gmail.com')
-        mail.login(user, password)
-        
+        mail = imap_login('imap.gmail.com', user, password)
+
         # Retrieve the list of folders/labels
         # list() returns a tuple: (status, [list of folders])
         status, folders = mail.list()
@@ -24,7 +26,7 @@ def get_gmail_folders():
         if status == 'OK':
             print(f"Folders for {user}:")
             for folder in folders:
-                # The folder string contains flags and the delimiter; 
+                # The folder string contains flags and the delimiter;
                 # we decode and print the full line.
                 print(folder.decode('utf-8'))
         else:

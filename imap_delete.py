@@ -14,6 +14,15 @@ import signal
 from datetime import datetime, timedelta
 from tqdm import tqdm
 
+from imap_common import (
+    ThreadConnectionPool,
+    compress_uids,
+    connect_and_select,
+    exponential_backoff,
+    find_trash_folder,
+    workers_for_server,
+)
+
 imaplib._MAXLINE = 10000000
 
 LOG_FILE = "imap_errors.log"
@@ -37,21 +46,13 @@ logger.addHandler(secure_file_handler(LOG_FILE))
 logger.addHandler(logging.StreamHandler(sys.stdout))
 
 shutdown_flag = threading.Event()
-active_connections = []
-connection_lock = threading.Lock()
-thread_local = threading.local()
+pool = ThreadConnectionPool()
 
 def signal_handler(sig, frame):
     logger.warning("Interrupt received. Gracefully shutting down connections...")
     print("\nInterrupt received. Halting and cleaning up...")
     shutdown_flag.set()
-    
-    with connection_lock:
-        for conn in active_connections:
-            try:
-                conn.logout()
-            except Exception:
-                pass
+    pool.close_all()
     sys.exit(0)
 
 # ---------- IMAP Helpers ----------
@@ -65,70 +66,20 @@ def get_imap_date_before(days: int) -> str:
     target_date = datetime.now() - timedelta(days=days)
     return target_date.strftime("%d-%b-%Y")
 
-def connect_and_select(server, user, password, mailbox, timeout):
-    ssl_context = ssl.create_default_context()
-    ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
-
-    mail = imaplib.IMAP4_SSL(server, ssl_context=ssl_context, timeout=timeout)
-    mail.login(user, password)
-
-    status, _ = mail.select(f'"{mailbox}"')
-    if status != "OK":
-        raise RuntimeError(f"Cannot select mailbox '{mailbox}'.")
-
-    mail.sock.settimeout(timeout)
-    return mail
-
-def get_thread_connection(server, user, password, folder, timeout):
-    if not hasattr(thread_local, "mail"):
-        logger.debug("Initializing new thread-local IMAP connection.")
-        conn = connect_and_select(server, user, password, folder, timeout)
-        thread_local.mail = conn
-        with connection_lock:
-            active_connections.append(conn)
-    return thread_local.mail
-
-def find_trash_folder(mail):
-    status, boxes = mail.list()
-    if status != "OK":
-        raise RuntimeError("Unable to list mailboxes.")
-
-    for box in boxes:
-        decoded = box.decode()
-        if "trash" in decoded.lower():
-            return decoded.split(' "/" ')[-1].strip('"')
-
-    raise RuntimeError("Trash folder not found.")
-
-def compress_uids(uid_list):
-    if not uid_list:
-        return b""
-    ints = [int(u) for u in uid_list]
-    ranges = []
-    start = end = ints[0]
-
-    for n in ints[1:]:
-        if n == end + 1:
-            end = n
-        else:
-            ranges.append(f"{start}:{end}" if start != end else str(start))
-            start = end = n
-
-    ranges.append(f"{start}:{end}" if start != end else str(start))
-    return ",".join(ranges).encode()
-
-def exponential_backoff(attempt, base_delay):
-    return base_delay * (2 ** attempt)
+def get_thread_connection(server, args):
+    return pool.get(
+        lambda: connect_and_select(server, args.user, args.password, args.folder, args.timeout)
+    )
 
 def wait_with_progress(delay_seconds: float, desc: str = "Waiting"):
     steps = int(delay_seconds)
     remainder = delay_seconds - steps
-    
+
     if steps > 0:
         for _ in tqdm(range(steps), desc=desc, leave=False, unit="s"):
             if shutdown_flag.is_set(): return
             time.sleep(1)
-            
+
     if remainder > 0 and not shutdown_flag.is_set():
         time.sleep(remainder)
 
@@ -212,8 +163,8 @@ def process_chunk(chunk_uids, trash_folder, supports_move, args, server, pbar):
 
     current_chunk_size = args.chunk_size
     i = 0
-    
-    mail = get_thread_connection(server, args.user, args.password, args.folder, args.timeout)
+
+    mail = get_thread_connection(server, args)
     quoted_trash = f'"{trash_folder}"'
 
     while i < len(chunk_uids):
@@ -246,7 +197,7 @@ def process_chunk(chunk_uids, trash_folder, supports_move, args, server, pbar):
 
                 i += len(sub_chunk)
                 pbar.update(len(sub_chunk))
-                
+
                 if args.chunk_delay > 0:
                     time.sleep(args.chunk_delay)
                 break
@@ -255,29 +206,26 @@ def process_chunk(chunk_uids, trash_folder, supports_move, args, server, pbar):
                 delay = exponential_backoff(attempt, args.delay)
                 logger.warning(f"Connection lost ({e}). Retrying in {delay}s.")
                 wait_with_progress(delay, f"Reconnecting ({delay}s)")
-                
+
                 try:
                     mail = connect_and_select(server, args.user, args.password, args.folder, args.timeout)
-                    thread_local.mail = mail
-                    with connection_lock:
-                        if mail not in active_connections:
-                            active_connections.append(mail)
+                    pool.replace(mail)
                 except Exception as reconnect_e:
                     logger.error(f"Reconnection failed: {reconnect_e}")
 
             except Exception as e:
                 error_msg = str(e)
                 if "LIMIT" in error_msg.upper():
-                    delay = exponential_backoff(attempt, 15.0) 
-                    
+                    delay = exponential_backoff(attempt, 15.0)
+
                     new_size = max(10, current_chunk_size // 2)
                     if new_size < current_chunk_size:
                         logger.warning(f"Rate limit hit. Reducing chunk size from {current_chunk_size} to {new_size}.")
                         current_chunk_size = new_size
-                        
+
                     logger.warning(f"Pausing for {delay}s before retry.")
                     wait_with_progress(delay, f"Rate limit ({delay}s)")
-                    
+
                     if attempt == args.retries - 1:
                         logger.error(f"Exhausted retries due to rate limits: {error_msg}")
                         return
@@ -350,12 +298,7 @@ def move_to_trash():
 
     # Apply defaults if missing
     if args.threads is None:
-        if "yahoo" in server:
-            args.threads = 3
-        elif "gmail" in server:
-            args.threads = 10
-        else:
-            args.threads = 1
+        args.threads = workers_for_server(server, default=1)
 
     if args.chunk_size is None:
         args.chunk_size = 12 if "yahoo" in server else 100
@@ -407,7 +350,7 @@ def move_to_trash():
             break
 
         logger.info(f"Pass {pass_number}: Processing {total} messages using {args.threads} threads...")
-        
+
         # Split total UIDs evenly among threads
         chunk_size = max(1, len(uids) // args.threads)
         chunks = [uids[i:i + chunk_size] for i in range(0, len(uids), chunk_size)]
@@ -435,12 +378,7 @@ def move_to_trash():
         pass_number += 1
 
     # Cleanup all connections
-    with connection_lock:
-        for conn in active_connections:
-            try:
-                conn.logout()
-            except Exception:
-                pass
+    pool.close_all()
 
     try:
         main_mail.logout()
@@ -451,5 +389,3 @@ def move_to_trash():
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     move_to_trash()
-
-
